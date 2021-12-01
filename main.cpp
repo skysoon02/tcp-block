@@ -6,56 +6,40 @@
 #include <unistd.h>
 
 #include "ethhdr.h"
-#include "arphdr.h"
-
-
-#define infect_frequency 10
-
+#include "iphdr.h"
+#include "tcphdr.h"
 
 #pragma pack(push, 1)
-struct EthArpPacket final {
-	EthHdr eth_;
-	ArpHdr arp_;
+struct RstTcpPacket final {
+	EthHdr eth;
+	IpHdr ip;
+	TcpHdr tcp;
 };
 #pragma pack(pop)
 
+#pragma pack(push, 1)
+struct FinTcpPacket final {
+	EthHdr eth;
+	IpHdr ip;
+	TcpHdr tcp;
+	char http[56]; 
+};
+#pragma pack(pop)
 
 pcap_t* handle;
 
+uint16_t calCheckSum(uint16_t* data, int size);
+void sendForwardPacket(EthHdr* org_ether, IpHdr* org_ip, TcpHdr* org_tcp, Mac my_Mac, int org_data_size);
+void sendBackwardPacket(EthHdr* org_ether, IpHdr* org_ip, TcpHdr* org_tcp, Mac my_Mac, int org_data_size);
 
 void usage() {
-	fprintf(stdout, "syntax: arp-spoof <interface> <sender ip 1> <target ip 1> [<sender ip 2> <target ip 2>...]\n");
-	fprintf(stdout, "sample: arp-spoof eth0\n");
-}
-
-
-void send_arp(
-	Mac eth_dmac, Mac eth_smac, uint16_t arp_op, Mac arp_smac, Ip arp_sip, Mac arp_tmac, Ip arp_tip){
-	EthArpPacket packet;
-
-	packet.eth_.dmac_ = eth_dmac;
-	packet.eth_.smac_ = eth_smac;
-	packet.eth_.type_ = htons(EthHdr::Arp);
-
-	packet.arp_.hrd_ = htons(ArpHdr::ETHER);
-	packet.arp_.pro_ = htons(EthHdr::Ip4);
-	packet.arp_.hln_ = Mac::SIZE;
-	packet.arp_.pln_ = Ip::SIZE;
-	packet.arp_.op_ = htons(arp_op);
-	packet.arp_.smac_ = arp_smac;
-	packet.arp_.sip_ = arp_sip;
-	packet.arp_.tmac_ = arp_tmac;
-	packet.arp_.tip_ = arp_tip;
-	
-	int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), sizeof(EthArpPacket));
-	if (res != 0) {
-		fprintf(stderr, "error: pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
-	}
+	fprintf(stdout, "syntax : tcp-block <interface> <pattern>\n");
+	fprintf(stdout, "sample : tcp-block wlan0 \"Host: test.gilgil.net\"\n");
 }
 
 
 int main(int argc, char* argv[]) {
-	if (argc < 4 || argc%2 != 0) {
+	if (argc != 3) {
 		usage();
 		return -1;
 	}
@@ -101,16 +85,8 @@ int main(int argc, char* argv[]) {
 	fprintf(stdout, "success: get my Mac & Ip\n");
 
 
-	//get Macs
-	Mac Macs[100];
-	for(int i=2; i<argc; i++) Macs[i] = Mac::nullMac();
-	
-	for(int i=2; i<argc; i++){	//send arp packet
-		send_arp(Mac::broadcastMac(), my_Mac, ArpHdr::Request, my_Mac, htonl(my_Ip), Mac::nullMac(), htonl(Ip(argv[i])));
-	}
-	
-	int count = argc-2;	//receive & parse arp packet
-	while(count){
+	//block tcp
+	while(true){
 		struct pcap_pkthdr* header;
 		const u_char* packet;
 		int res = pcap_next_ex(handle, &header, &packet);
@@ -120,71 +96,120 @@ int main(int argc, char* argv[]) {
 			break;
 		}
 		
-		EthHdr* ether = (EthHdr*)packet;
-		if(ether->type_ != htons(EthHdr::Arp)) continue;
-		ArpHdr* arp = (ArpHdr*)(packet + sizeof(EthHdr));
-		if(arp->op_ != htons(ArpHdr::Reply)) continue;
+		EthHdr* ether = (EthHdr*)packet;	//find offset of Ethernet, Ip, Tcp, Data
+		if(ether->type != htons(EthHdr::Ip4)) continue;
+		IpHdr* ip = (IpHdr*)((u_char*)ether + sizeof(EthHdr));
+		if(ip->protocol != IpHdr::Tcp) continue;
+		TcpHdr* tcp = (TcpHdr*)((u_char*)ip + (ip->hln())*4);
+		u_char* data_offset = (u_char*)((u_char*)tcp + (tcp->dataOff())*4);
 		
-		for(int i=2; i<argc; i++){
-			if(arp->sip_ != htonl(Ip(argv[i])) || Macs[i] != Mac::nullMac()) continue;
-			Macs[i] = arp->smac_;
-			count--;
-			break;
-		}
-	}
-	fprintf(stdout, "success: get senders' Mac\n");
-	
-	
-	//infect senders
-	for(int i=2; i<argc; i+=2){	//send arp packet
-		send_arp(Macs[i], my_Mac, ArpHdr::Reply, my_Mac, htonl(Ip(argv[i+1])), Macs[i], htonl(Ip(argv[i])));
-	}
-	
-	
-	//relay packet
-	int cnt = infect_frequency;
-	while(1){
-		if(cnt==0){	//infect senders periodically
-			for(int i=2; i<argc; i+=2){
-				send_arp(Macs[i], my_Mac, ArpHdr::Reply, my_Mac, htonl(Ip(argv[i+1])), Macs[i], htonl(Ip(argv[i])));
-			}
-			cnt = infect_frequency;
-			fprintf(stdout, "send: periodical arp\n");
-		}
-		cnt--;
-	
-		struct pcap_pkthdr* header;
-		const u_char* packet;
-		int res = pcap_next_ex(handle, &header, &packet);
-		if (res == 0) continue;
-		if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK) {
-			fprintf(stderr, "error: pcap_next_ex return %d(%s)\n", res, pcap_geterr(handle));
-			break;
-		}
+		char data[65536] = {0};	//pattern search
+		int data_size = ntohs(ip->tln) - (ip->hln())*4 - (tcp->dataOff())*4;
+		strncpy(data, (char*)data_offset, data_size);
+		if(strstr(data, argv[2])==0) continue;
 		
-		EthHdr* ether = (EthHdr*)packet;
-		if(ether->type_ == htons(EthHdr::Arp)){	//reply to arp request
-			ArpHdr* arp = (ArpHdr*)(packet + sizeof(EthHdr));
-			if(arp->op_ == htons(ArpHdr::Request)){
-				send_arp(ether->smac_, my_Mac, ArpHdr::Reply, my_Mac, arp->tip_, arp->smac_, arp->sip_);
-				fprintf(stdout, "send: reply to arp request\n");
-			}
-		}
-		else{	//check src mac and relay packet
-			for(int i=2; i<argc; i+=2){
-				if(ether->smac_ == Macs[i]){
-					fprintf(stdout, "send: relay %s to %s\n", argv[i], argv[i+1]);
-					ether->smac_ = my_Mac;
-					ether->dmac_ = Macs[i+1];
-					int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(packet), header->caplen);
-					if (res != 0) {
-						fprintf(stderr, "error: pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
-					}
-					break;
-				}
-			}
-		}
-	}
-	
+		sendForwardPacket(ether, ip, tcp, my_Mac, data_size);
+		sendBackwardPacket(ether, ip, tcp, my_Mac, data_size);
+		
+		printf("block!!\n");
+	}		
 	pcap_close(handle);
 }
+
+
+uint16_t calCheckSum(uint16_t* data, int size){
+	uint32_t ret = 0;
+	for(int i=0; i<size/2; i++){
+		ret += data[i];
+	}
+	if(size%2==1){
+		ret += *((uint8_t*)data+size-1);
+	}
+	while(ret>0xFFFF){
+		ret = (ret&0xFFFF) + (ret>>16);
+	}
+	ret = ret ^ 0xFFFF;
+	return (uint16_t)ret;
+}
+
+void sendForwardPacket(EthHdr* org_ether, IpHdr* org_ip, TcpHdr* org_tcp, Mac my_Mac, int org_data_size){
+	RstTcpPacket packet;
+	memset(&packet, 0, sizeof(packet));
+	
+	packet.eth.sMac = my_Mac;
+	packet.eth.dMac = org_ether->dMac;
+	packet.eth.type = htons(EthHdr::Ip4);
+	
+	packet.ip.ver_hln = 0x40 | (sizeof(IpHdr)/4);
+	//packet.ip.type
+	packet.ip.tln = htons(sizeof(IpHdr) + sizeof(TcpHdr));
+	//packet.ip.id
+	//packet.ip.fragOff
+	packet.ip.ttl = org_ip->ttl;
+	packet.ip.protocol = IpHdr::Tcp;
+	packet.ip.sIp = org_ip->sIp;
+	packet.ip.dIp = org_ip->dIp;
+	packet.ip.checkSum = calCheckSum((uint16_t*)&packet.ip, sizeof(IpHdr));
+	
+	packet.tcp.sPort = org_tcp->sPort;
+	packet.tcp.dPort = org_tcp->dPort;
+	packet.tcp.seq = htonl(ntohl(org_tcp->seq) + org_data_size);
+	packet.tcp.ack = org_tcp->ack;
+	packet.tcp.flag = 0x0050 | 0x1400;	//20bytes | ACK, RST
+	packet.tcp.winSize = org_tcp->winSize;	//???
+	//packet.tcp.urgPoint
+	
+	char pseudoHdr[12 + sizeof(TcpHdr)] = {0};
+	memcpy(pseudoHdr, &packet.ip.sIp, 8);
+	pseudoHdr[9] = IpHdr::Tcp;
+	*(uint16_t*)(pseudoHdr+10) = htons((uint16_t)sizeof(TcpHdr));
+	memcpy(pseudoHdr+12, &packet.tcp, sizeof(TcpHdr));
+	packet.tcp.checkSum = calCheckSum((uint16_t*)pseudoHdr, 12+sizeof(TcpHdr));
+	
+	int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), sizeof(packet));
+	if (res != 0) {
+		fprintf(stderr, "error: pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
+	}
+}
+void sendBackwardPacket(EthHdr* org_ether, IpHdr* org_ip, TcpHdr* org_tcp, Mac my_Mac, int org_data_size){
+	FinTcpPacket packet;
+	memset(&packet, 0, sizeof(packet));
+	
+	packet.eth.sMac = my_Mac;
+	packet.eth.dMac = org_ether->sMac;
+	packet.eth.type = htons(EthHdr::Ip4);
+	
+	packet.ip.ver_hln = 0x40 | (sizeof(IpHdr)/4);
+	//packet.ip.type
+	packet.ip.tln = htons(sizeof(IpHdr) + sizeof(TcpHdr) + 55);
+	//packet.ip.id
+	//packet.ip.fragOff
+	packet.ip.ttl = 128;
+	packet.ip.protocol = IpHdr::Tcp;
+	packet.ip.sIp = org_ip->dIp;
+	packet.ip.dIp = org_ip->sIp;
+	packet.ip.checkSum = calCheckSum((uint16_t*)&packet.ip, sizeof(IpHdr));
+	
+	packet.tcp.sPort = org_tcp->dPort;
+	packet.tcp.dPort = org_tcp->sPort;
+	packet.tcp.seq = org_tcp->ack;
+	packet.tcp.ack = htonl(ntohl(org_tcp->seq) + org_data_size);
+	packet.tcp.flag = 0x0050 | 0x1100;	//20bytes | ACK, FIN
+	packet.tcp.winSize = org_tcp->winSize;	//???
+	//packet.tcp.urgPoint
+	
+	strcpy(packet.http, "HTTP/1.0 302 Redirect\r\nLocation: http://warning.or.kr\r\n");
+	
+	char pseudoHdr[12 + sizeof(TcpHdr) + 55] = {0};
+	memcpy(pseudoHdr, &packet.ip.sIp, 8);
+	pseudoHdr[9] = IpHdr::Tcp;
+	*(uint16_t*)(pseudoHdr+10) = htons((uint16_t)sizeof(TcpHdr)+55);
+	memcpy(pseudoHdr+12, &packet.tcp, sizeof(TcpHdr)+55);
+	packet.tcp.checkSum = calCheckSum((uint16_t*)pseudoHdr, 12+sizeof(TcpHdr)+55);
+	
+	int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), sizeof(packet)-1);
+	if (res != 0) {
+		fprintf(stderr, "error: pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
+	}
+}
+
