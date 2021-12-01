@@ -9,11 +9,7 @@ struct EthHdr final {
 	Mac sMac;
 	uint16_t type;
 
-	Mac dmac() { return dmac_; }
-	Mac smac() { return smac_; }
-	uint16_t type() { return ntohs(type_); }
-
-	// Type(type_)
+	//type
 	enum: uint16_t {
 		Ip4 = 0x0800,
 		Arp = 0x0806,

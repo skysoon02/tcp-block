@@ -12,6 +12,8 @@ struct TcpHdr final {
 	uint16_t winSize;
 	uint16_t checkSum;
 	uint16_t urgPoint;
+	
+	uint8_t dataOff() { return (flag & 0x00F0)>>4; }
 };
 typedef TcpHdr *PTcpHdr;
 #pragma pack(pop)
